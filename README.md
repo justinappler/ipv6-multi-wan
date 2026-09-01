@@ -180,7 +180,7 @@ The router-side behaviors that address this, in increasing order of effort:
 | Behavior | What it fixes | Standard |
 | :-- | :-- | :-- |
 | RA with Router Lifetime 0 on uplink loss | Removes the router as a default router | RFC 7084 G-5 (unchanged in 7084bis) |
-| PIO with **Preferred Lifetime 0** for the stale prefix | Hosts stop *sourcing new connections* from it immediately | RFC 7084 L-13; [RFC 9096 §3.5](https://www.rfc-editor.org/rfc/rfc9096); 7084bis L-13 |
+| Prefix Information Option (PIO) with **Preferred Lifetime 0** for the stale prefix | Hosts stop *sourcing new connections* from it immediately | RFC 7084 L-13; [RFC 9096 §3.5](https://www.rfc-editor.org/rfc/rfc9096); 7084bis L-13 |
 | ICMPv6 Destination Unreachable, **code 5** for packets sourced from an invalidated prefix | Converts silent timeouts into immediate errors, and in principle steers the host to another source address | 7084bis L-14 (new); RFC 8678 §6.2.3 |
 | SADR + conditional RAs for a second prefix | Genuine dual-provider operation, not just clean degradation | RFC 8678, RFC 8475 |
 
@@ -205,6 +205,13 @@ requirements document.
 
 The distinction between the two lifetimes decides whether deprecation actually
 changes host behavior, and the two are not interchangeable:
+
+Both lifetimes live in the Prefix Information Option — the part of a Router
+Advertisement that names a prefix and tells hosts what to do with it
+([RFC 4861 §4.6.2](https://www.rfc-editor.org/rfc/rfc4861#section-4.6.2)): the
+prefix and length, the on-link (L) and autonomous (A) flags, and the two
+lifetimes. One RA can carry several, which is how a single router advertises two
+providers' prefixes on one LAN.
 
 - **Preferred Lifetime 0 deprecates the address immediately.** RFC 6724 Rule 3
   ("avoid deprecated addresses") makes hosts skip it for *new* connections while
@@ -453,6 +460,7 @@ multihoming in any form and accept a single upstream delegation. Assume no.
 | :-- | :-- | :-- |
 | **[RFC 3582](https://www.rfc-editor.org/rfc/rfc3582)** | Goals for IPv6 Site-Multihoming Architectures | The reference framing for what multihoming should deliver: redundancy, load sharing, traffic engineering, policy. |
 | **[RFC 4218](https://www.rfc-editor.org/rfc/rfc4218)** | Threats Relating to IPv6 Multihoming Solutions | Redirection and hijacking risks any multihoming mechanism has to avoid. |
+| **[RFC 4861](https://www.rfc-editor.org/rfc/rfc4861)** | Neighbor Discovery for IPv6 | Defines Router Advertisements, the Prefix Information Option and its lifetimes, and the Router Lifetime field. |
 | **[RFC 4862](https://www.rfc-editor.org/rfc/rfc4862)** | IPv6 Stateless Address Autoconfiguration | §5.5.3(e) is the two-hour rule — the reason naive `valid=0` deprecation fails. |
 | **[RFC 6296](https://www.rfc-editor.org/rfc/rfc6296)** | IPv6-to-IPv6 Network Prefix Translation (NPTv6) | Stateless, checksum-neutral 1:1 prefix mapping. Not NAT66. |
 | **[RFC 5533](https://www.rfc-editor.org/rfc/rfc5533)** | Site Multihoming by IPv6 Intermediation (SHIM6) | The host-based approach. Defined, essentially undeployed; useful as background to multipath transports. |
