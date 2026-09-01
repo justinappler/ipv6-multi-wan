@@ -38,9 +38,16 @@ This constrains the design more than any router feature does.
   specific capability, not a spec guarantee. UniFi exposes this as "Single
   Network" mode.
 - **No usable IPv6 prefix** (IPv4-only service, or a modem that will not pass one
-  through). That provider cannot participate in PA multihoming at all;
-  translation from a stable internal prefix is the only way that path carries
-  IPv6.
+  through). Translation does not help here: NPTv6 and NAT66 both map IPv6 to
+  IPv6 and need an external IPv6 prefix to map onto. The only way that path
+  carries IPv6 is encapsulation — a 6in4 tunnel broker, or a tunnel to an
+  endpoint that has IPv6 — which brings its own MTU and MSS-clamping
+  considerations, and whose endpoint address is independent of the uplink.
+  Failing that, IPv6 continues only via another uplink that still has it, and
+  when no such uplink remains, the site is IPv4-only for the duration. That last
+  case is the one that makes correct deprecation signaling essential rather than
+  merely tidy: hosts have to fall back to IPv4 promptly instead of hanging on
+  addresses with no path.
 
 Note that prefix size and delivery method are independent constraints. A small
 prefix limits how many segments a provider can serve; an on-link assignment
@@ -119,7 +126,8 @@ reconfiguration — but there is no deterministic external address for a LAN hos
 so every inbound service needs an explicit DNAT rule — per-service port forwarding, on a protocol designed not to need it.
 
 - **Verdict**: NPTv6 is a reasonable stopgap and the only approach where failover
-  works without SADR, because the LAN prefix never changes. NAT66 is strictly
+  works without SADR, because the LAN prefix never changes. Both forms assume
+  every uplink you intend to translate onto has its own IPv6 prefix. NAT66 is strictly
   worse for anything you host, and strictly simpler to operate. Check which one
   your platform actually implements — see [State of the Ecosystem](#state-of-the-ecosystem).
 
