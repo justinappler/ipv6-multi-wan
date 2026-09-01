@@ -181,7 +181,7 @@ The router-side behaviors that address this, in increasing order of effort:
 | :-- | :-- | :-- |
 | RA with Router Lifetime 0 on uplink loss | Removes the router as a default router | RFC 7084 G-5 (unchanged in 7084bis) |
 | PIO with **Preferred Lifetime 0** for the stale prefix | Hosts stop *sourcing new connections* from it immediately | RFC 7084 L-13; [RFC 9096 §3.5](https://www.rfc-editor.org/rfc/rfc9096); 7084bis L-13 |
-| ICMPv6 Destination Unreachable, **code 5** for packets sourced from an invalidated prefix | Converts silent timeouts into immediate errors | 7084bis L-14 (new) |
+| ICMPv6 Destination Unreachable, **code 5** for packets sourced from an invalidated prefix | Converts silent timeouts into immediate errors, and in principle steers the host to another source address | 7084bis L-14 (new); RFC 8678 §6.2.3 |
 | SADR + conditional RAs for a second prefix | Genuine dual-provider operation, not just clean degradation | RFC 8678, RFC 8475 |
 
 The first three are degradation done properly: IPv6 stops cleanly and hosts fall
@@ -237,14 +237,50 @@ changes host behavior, and the two are not interchangeable:
   attributes this to RFC 4862's item (e) — which is the trap visible in a
   released product.
 
-### Signaling the failure to clients that ignore RAs
+### Signaling source-address failure with ICMPv6
 
 7084bis **L-14** (new relative to RFC 7084) requires the CE router to send ICMPv6
 Destination Unreachable **code 5** ("source address failed ingress/egress policy")
-for packets forwarded to it using an address from an invalidated prefix. This is
-the fix for clients that never see or never act on the RA: they get an immediate
-error instead of a timeout. It is also more precisely testable than "send a
-deprecation RA": a single packet capture confirms or refutes conformance.
+for packets forwarded to it using an address from an invalidated prefix. The
+signal has two distinct jobs, and they are worth separating.
+
+**As a failure signal**, it helps clients that never saw or never acted on the RA:
+they get an immediate error instead of a timeout, and can fall back. It is also
+more precisely testable than "send a deprecation RA" — a packet capture confirms
+or refutes conformance.
+
+**As a source-selection signal**, it is meant to do more. [RFC 8678
+§6.2.3](https://www.rfc-editor.org/rfc/rfc8678) reads code 5 as "this source
+address is wrong, try another," and §6.3.3 builds an uplink-failure design on it:
+the host retries with an address from the surviving provider's prefix and gets
+through. This is the **per-destination** complement to prefix deprecation, which
+is necessarily all-or-nothing per prefix — §6.3.1 notes that deprecating a prefix
+also stops hosts using it for internal destinations that remain reachable through
+it. Where a site wants "this destination via provider B, everything else via A,"
+ICMPv6 is the mechanism that operates at the right granularity.
+
+Its limits are equally worth stating:
+
+- **Host reaction is not standardized.** [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443)
+  defines the code; it does not require a host to retry with a different source
+  address. RFC 8678 states plainly that the current behavior of host operating
+  systems on receiving code 5 "is not clear to the authors" and asks for testing
+  data. Nothing since has established broad support, so treat source-steering as
+  aspirational and verify per platform.
+- **There is no indication of which source to use next.** A host that does retry
+  iterates over its addresses — and RFC 8981 temporary addresses mean several per
+  prefix — which is slow. RFC 8678 discusses an ICMPv6 extension carrying the
+  correct source prefix, but leaves it undefined.
+- **Rate limits and spoofing.** Routers cap ICMP error generation, so at scale the
+  message may simply not arrive during the mass-failure event that most needs it;
+  hosts caching a source address per destination improves scalability but creates
+  its own staleness problem on failover. Forged code 5 messages are a
+  denial-of-service vector.
+
+RFC 8678's own conclusion is the right summary: Router Advertisements are the
+reliable mechanism for steering source selection, and ICMPv6 is a supplementary
+signal for failures the RAs did not anticipate. Design for the former; treat the
+latter as improving worst-case behavior rather than carrying it.
 
 ### Health detection
 
