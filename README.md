@@ -14,9 +14,12 @@ precisely because it preserves end-to-end addressing — every host holds a
 globally routable address derived from a specific provider's prefix. Failover
 therefore has to change what addresses hosts *use*, not just where packets go.
 
-The primary focus is **Provider-Assigned (PA) multihoming without NAT**. We also
-cover translation-based workarounds (NPTv6 and, separately, NAT66 — they are not
-the same thing) and note BGP for context.
+It covers what multihoming is asked to deliver at this scale, the architectures
+available to deliver it, the router and host mechanisms each depends on, and what
+current equipment actually implements. The emphasis is on **Provider-Assigned
+(PA) multihoming without NAT**, since that is the approach IPv6 was designed
+around, but translation, transport-layer multihoming, and PI space with BGP are
+covered as the real alternatives they are.
 
 ### What your uplinks actually give you
 
@@ -55,33 +58,24 @@ affects whether you can use it on the LAN at all.
 
 ---
 
-## The failure mode this document exists to solve
+## What multihoming is asked to deliver
 
-When a dual-stack LAN loses its primary uplink and the router does nothing about
-IPv6 addressing, hosts keep a valid-looking GUA from the dead provider's prefix
-and a default route to a router that still advertises itself. Two outcomes:
+[RFC 3582](https://www.rfc-editor.org/rfc/rfc3582) sets out the goals for IPv6
+site multihoming: redundancy, load sharing, traffic engineering, policy control,
+and doing all of that without exploding the global routing table. At CE and SMB
+scale those goals separate sharply by how achievable they are:
 
-1. **The router keeps forwarding.** Packets exit the surviving WAN with a source
-   address from the dead provider's prefix and are dropped by that provider's
-   BCP 38 ingress filter. Silent timeouts.
-2. **The router drops locally without signaling.** Same silence, one hop earlier.
+| Goal | Achievable at CE/SMB scale? |
+| :-- | :-- |
+| **Redundancy / failover** — traffic survives the loss of one uplink | Yes. Requires the router to manage LAN addressing, not just routes. |
+| **Outbound load sharing** — spread traffic across uplinks | Partially, and not the way IPv4 does it. See [Load sharing](#load-sharing). |
+| **Inbound load sharing** — distribute arriving connections | Not without DNS tricks or PI space and BGP. |
+| **Policy routing** — send particular traffic via a particular provider | Yes with translation; constrained without it, because the host picks the source address. |
+| **Bandwidth aggregation for a single flow** | Not at the network layer. Requires multipath transport or a bonding service. |
 
-Either way IPv6 fails *silently* while IPv4 fails over cleanly — so enabling IPv6
-makes the outage worse than not having it. Happy Eyeballs v2 masks this for
-browsers (they race both families and fall back on connect failure, paying
-latency), but Happy Eyeballs is a **per-application** behavior, not a stack
-property: glibc's `getaddrinfo` has none, so `apt`, `git`, `docker pull`, mail
-clients and most IoT firmware resolve AAAA, connect, and hang. That is the real
-blast radius, and it is the argument for fixing this at the gateway.
-
-The correct router behaviors are, in increasing order of effort:
-
-| Behavior | What it fixes | Standard |
-| :-- | :-- | :-- |
-| RA with Router Lifetime 0 on WAN loss | Removes the router as a default router | RFC 7084 G-5 (unchanged in 7084bis) |
-| PIO with **Preferred Lifetime 0** for the stale prefix | Hosts stop *sourcing new connections* from it immediately | RFC 7084 L-13; [RFC 9096 §3.5](https://www.rfc-editor.org/rfc/rfc9096); 7084bis L-13 |
-| ICMPv6 Destination Unreachable, **code 5** for packets sourced from an invalidated prefix | Turns silent timeouts into immediate errors for non-Happy-Eyeballs clients | 7084bis L-14 (new) |
-| SADR + conditional RAs for a second prefix | Actual dual-provider operation | RFC 8678, RFC 8475 |
+Redundancy is the goal most CE and SMB deployments are actually pursuing, and the
+one where IPv6 diverges most from IPv4 — it needs the router to manage LAN
+addressing, not merely routes. It gets correspondingly more attention below.
 
 ---
 
@@ -131,7 +125,30 @@ so every inbound service needs an explicit DNAT rule — per-service port forwar
   worse for anything you host, and strictly simpler to operate. Check which one
   your platform actually implements — see [State of the Ecosystem](#state-of-the-ecosystem).
 
-### 3. Provider-Independent (PI) Space + BGP (the enterprise way)
+### 3. Host- and Transport-Layer Multihoming
+
+Multihoming can also be handled above the network layer, by endpoints that hold
+addresses from both providers and move traffic between them themselves.
+
+- **[SHIM6](https://www.rfc-editor.org/rfc/rfc5533)** (RFC 5533) defined a
+  host-based shim providing locator agility beneath the transport layer. It was
+  never deployed; no mainstream OS ships it in a usable state. Historical
+  interest only, but it explains why later work moved to the transport layer.
+- **Multipath transports** are the live version of this idea. MPTCP is deployed
+  in specific places (notably Apple platform services and some carrier
+  offload deployments), and
+  [multipath QUIC](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/)
+  reached the RFC Editor queue in 2026. Both establish subflows over multiple
+  paths and survive the loss of one.
+- **Verdict**: not something a site operator deploys unilaterally — both
+  endpoints must support it, and you control only one. Its practical effect is
+  that a growing minority of traffic already survives uplink failure regardless
+  of what the CE router does, which is worth knowing when interpreting test
+  results, but it is not a substitute for correct gateway behavior. It also does
+  nothing for the hosts and protocols that fail hardest, which are the ones least
+  likely to implement it.
+
+### 4. Provider-Independent (PI) Space + BGP (the enterprise way)
 
 Own the address space, announce it to multiple peers. For consumer/SMB links this
 is non-viable on cost, contract, and ISP policy grounds. Included only so the
@@ -139,7 +156,36 @@ comparison is complete.
 
 ---
 
-## Technical Requirements for PA Multihoming
+## Mechanisms for PA Multihoming
+
+### Why failover needs more than a routing change
+
+The defining difference from IPv4: when an uplink fails, the routes are not the
+only stale state. Hosts still hold global addresses derived from that provider's
+prefix, and will keep sourcing packets from them. Two outcomes, neither good:
+
+1. **The router keeps forwarding.** Packets leave the surviving uplink carrying a
+   source address from the failed provider's prefix, and are dropped by that
+   provider's BCP 38 ingress filter. Silent timeouts.
+2. **The router drops locally without signaling.** Same silence, one hop earlier.
+
+Either way IPv6 fails silently while IPv4 fails over cleanly, so a dual-stack
+site can be worse off than a single-stack one during an outage. Happy Eyeballs v2
+limits the damage for applications that implement it, but it is a
+per-application behavior rather than a stack property — clients that resolve a
+AAAA record and commit to it simply hang.
+
+The router-side behaviors that address this, in increasing order of effort:
+
+| Behavior | What it fixes | Standard |
+| :-- | :-- | :-- |
+| RA with Router Lifetime 0 on uplink loss | Removes the router as a default router | RFC 7084 G-5 (unchanged in 7084bis) |
+| PIO with **Preferred Lifetime 0** for the stale prefix | Hosts stop *sourcing new connections* from it immediately | RFC 7084 L-13; [RFC 9096 §3.5](https://www.rfc-editor.org/rfc/rfc9096); 7084bis L-13 |
+| ICMPv6 Destination Unreachable, **code 5** for packets sourced from an invalidated prefix | Converts silent timeouts into immediate errors | 7084bis L-14 (new) |
+| SADR + conditional RAs for a second prefix | Genuine dual-provider operation, not just clean degradation | RFC 8678, RFC 8475 |
+
+The first three are degradation done properly: IPv6 stops cleanly and hosts fall
+back to IPv4. Only the fourth keeps IPv6 working across the failure.
 
 ### Routing outbound traffic (SADR)
 
@@ -157,13 +203,13 @@ requirements document.
 
 ### Guiding hosts (conditional RAs) — and the valid-vs-preferred trap
 
-This is the single most common implementation error, so be precise when filing a
-bug or writing a script:
+The distinction between the two lifetimes decides whether deprecation actually
+changes host behavior, and the two are not interchangeable:
 
 - **Preferred Lifetime 0 deprecates the address immediately.** RFC 6724 Rule 3
   ("avoid deprecated addresses") makes hosts skip it for *new* connections while
   existing ones drain. There is no clamp on reductions to the preferred lifetime.
-- **Valid Lifetime 0 does not do what you expect.** [RFC 4862
+- **Valid Lifetime 0 does not invalidate promptly.** [RFC 4862
   §5.5.3(e)](https://www.rfc-editor.org/rfc/rfc4862) — the "two-hour rule" — says
   a host may not reduce an address's remaining valid lifetime below two hours in
   response to an unauthenticated RA. A naive `valid=0` implementation buys a
@@ -184,7 +230,12 @@ bug or writing a script:
   §5.3 formally updates RFC 4862 to let hosts honor small valid lifetimes (-14,
   5 July 2026; WG document, revised I-D needed as of this writing). The Linux
   kernel and NetworkManager already behave this way, per the draft's
-  implementation-status section. Don't design around it yet.
+  implementation-status section, but it is not safe to design around yet.
+- **This is not hypothetical.** The same draft documents a shipping consumer CE
+  router (AVM FRITZ!Box) that deprecates stale prefixes with Preferred Lifetime 0
+  and a Valid Lifetime starting at two hours rather than zero — the draft
+  attributes this to RFC 4862's item (e) — which is the trap visible in a
+  released product.
 
 ### Signaling the failure to clients that ignore RAs
 
@@ -197,18 +248,53 @@ deprecation RA": a single packet capture confirms or refutes conformance.
 
 ### Health detection
 
-Interface link state is not connectivity. You need active probing (ICMP echo to
-multiple off-net targets, or BFD where available) per uplink, and the resulting
-state must drive three things: the SADR rules, the RA daemon's per-prefix
-lifetimes, and the ICMPv6 error behavior above. A health check that only drives
-the IPv4 default route is why IPv6 blackholes on most consumer gear.
+Interface link state is not connectivity. Active probing per uplink (ICMP echo to
+several off-net targets, or BFD where available) is required, and the resulting
+state has to drive three things: the SADR rules, the RA daemon's per-prefix
+lifetimes, and the ICMPv6 error behavior above. Where a health check exists but
+drives only the IPv4 default route, the IPv6 side of the failure goes
+unhandled — a pattern visible in several of the platforms surveyed below.
 
 ---
 
+## Load sharing
+
+Load sharing is the half of multi-WAN that transfers least well from IPv4. Under
+PA multihoming, **the host chooses the source address** (RFC 6724), and under SADR the source address
+determines the exit path. The router therefore cannot spread flows across
+providers the way an IPv4 NAT does, because not rewriting the source is precisely
+the property being preserved.
+
+What that leaves:
+
+- **Coarse, prefix-level influence.** Advertising both prefixes but deprecating
+  one, adjusting relative preference, or using RFC 4191 route information and
+  RFC 8475 conditional RAs shifts traffic in aggregate. It operates per prefix,
+  not per flow, and hosts may take their time responding.
+- **Per-flow balancing requires translation.** Once the router rewrites the source
+  prefix, it can select an uplink per flow exactly as in IPv4, with return traffic
+  arriving on the right link. With NPTv6 this stays stateless — a given internal
+  address has one mapping per external prefix. The cost is end-to-end addressing.
+- **Destination-based policy** ("this traffic goes via provider B") has the same
+  shape: straightforward with translation, awkward without it, because the router
+  would have to induce the host to pick a matching source address.
+- **Inbound distribution** cannot be solved at the CE. DNS with multiple AAAA
+  records spreads connections but has no health awareness unless something
+  updates it; genuine inbound engineering needs PI space and BGP.
+- **A single flow never exceeds one uplink's capacity** at the network layer. Two
+  connections do not combine into one faster one. That requires multipath
+  transport with cooperating endpoints, or a bonding service terminating both
+  links at a common endpoint.
+
+For most CE and SMB sites the honest summary is that IPv6 multihoming buys
+redundancy, and buys load sharing only in the coarse sense — unless translation
+is acceptable, in which case IPv4-style balancing returns along with IPv4-style
+costs.
+
 ## Host-Side Reality
 
-Even a perfect router is bounded by host behavior. This is where deployments
-actually fail.
+Router behavior is bounded by what hosts do with the information it provides.
+The mechanisms above assume host support that is uneven in practice.
 
 - **RFC 6724 Rule 3 is what makes deprecation work.** Rule 5.5 (prefer a source
   address advertised by the next hop you're using) is the piece that makes *two
@@ -261,32 +347,25 @@ relying on them.
   moved to `/run/dnsmasq.dhcp.conf.d/` on newer Network releases). The WAN PD
   client is **odhcp6c**. No radvd, no odhcpd. The UI's RA toggle and RA priority
   map onto dnsmasq's `enable-ra` / `ra-param`.
-- **The RA daemon is not the limiting factor.** With
-  `dhcp-range=::,constructor:<bridge>,…`, dnsmasq derives advertised prefixes
-  from the global addresses actually present on the bridge and follows their
-  state: departed prefixes move to an "old prefix" list and are advertised with
-  zeroed lifetimes, and its `deprecated` lease-time mode sets the preferred
-  lifetime to zero. It will also advertise multiple prefixes on one interface.
-  Because it is driven entirely by kernel address state, deprecation follows
-  automatically from deprecating or removing the bridge address. The gap is
-  above it: UniFi's failover logic operates at the IPv4 route/NAT layer and does
-  not touch LAN-side IPv6 addressing, so a stale prefix stays live with a router
-  still advertising it.
+- **The RA daemon is not the limiting factor.** dnsmasq's `constructor:` ranges
+  derive advertised prefixes from the addresses present on the bridge and follow
+  their state — departed prefixes are advertised with zeroed lifetimes, and its
+  `deprecated` lease-time mode sets the preferred lifetime to zero — and it will
+  advertise multiple prefixes on one interface. Since it is driven by kernel
+  address state, deprecation follows from deprecating the bridge address. The gap
+  is above it: failover logic operates at the IPv4 route/NAT layer and does not
+  touch LAN-side IPv6 addressing, so a stale prefix stays live.
 - **NAT66 is not NPTv6.** UniFi added IPv6 NAT66 rules to the Policy Table in
   Network 9.4.19; per Ubiquiti's own NAT documentation the engine offers SNAT,
   DNAT, and Masquerade, with Masquerade the default — stateful PAT, no stateless
   1:1 prefix mapping. That is worse than pfSense/OPNsense NPTv6 for inbound, and
   fine for outbound-only failover.
-- **ULA addressing is available**: the "Additional IPs" option on a VLAN's IPv6
-  settings (added in Network 10.0.160, November 2025) allows a segment to carry
-  both a PD-derived global prefix and a ULA.
-- **No IPv6 failover handling as of Network 10.6.101 (26 August 2026).** IPv6
-  work through 2026 has been reporting, WireGuard, DS-Lite, MAP-E, and validation
-  fixes; nothing that deprecates prefixes or implements SADR on WAN failover.
-- **The config is generated, not authoritative on disk.** The controller
-  rewrites the dnsmasq configuration on provisioning, network edits, and firmware
-  updates, so local modifications do not survive. Any workaround has to be
-  reapplied by an on-boot hook, and can still race a re-provision.
+- **No IPv6 failover handling as of Network 10.6.101 (26 August 2026)**, and no
+  SADR. IPv6 work through 2026 has been reporting, WireGuard, DS-Lite, MAP-E and
+  validation fixes. ULA addressing is available ("Additional IPs" on a VLAN's
+  IPv6 settings, added in Network 10.0.160, November 2025). Note that the dnsmasq
+  configuration is generated by the controller and rewritten on provisioning, so
+  changes made on the device do not persist.
 
 ### OpenWrt (25.12 stable; 24.10 old stable as of September 2026)
 
@@ -336,8 +415,11 @@ multihoming in any form and accept a single upstream delegation. Assume no.
 
 | RFC | Title | Relevance |
 | :-- | :-- | :-- |
+| **[RFC 3582](https://www.rfc-editor.org/rfc/rfc3582)** | Goals for IPv6 Site-Multihoming Architectures | The reference framing for what multihoming should deliver: redundancy, load sharing, traffic engineering, policy. |
+| **[RFC 4218](https://www.rfc-editor.org/rfc/rfc4218)** | Threats Relating to IPv6 Multihoming Solutions | Redirection and hijacking risks any multihoming mechanism has to avoid. |
 | **[RFC 4862](https://www.rfc-editor.org/rfc/rfc4862)** | IPv6 Stateless Address Autoconfiguration | §5.5.3(e) is the two-hour rule — the reason naive `valid=0` deprecation fails. |
 | **[RFC 6296](https://www.rfc-editor.org/rfc/rfc6296)** | IPv6-to-IPv6 Network Prefix Translation (NPTv6) | Stateless, checksum-neutral 1:1 prefix mapping. Not NAT66. |
+| **[RFC 5533](https://www.rfc-editor.org/rfc/rfc5533)** | Site Multihoming by IPv6 Intermediation (SHIM6) | The host-based approach. Defined, essentially undeployed; useful as background to multipath transports. |
 | **[RFC 6724](https://www.rfc-editor.org/rfc/rfc6724)** | Default Address Selection for IPv6 | Rule 3 (avoid deprecated) makes preferred-lifetime-0 work. Rule 5.5 is what makes two live prefixes work, and is the weakly supported part. |
 | **[RFC 7084](https://datatracker.ietf.org/doc/html/rfc7084)** | Basic Requirements for IPv6 Customer Edge Routers | G-5 (router lifetime 0 on WAN loss), L-13 (deprecate replaced prefixes), L-2 (a /64 per LAN interface). Being obsoleted — see below. |
 | **[RFC 7157](https://www.rfc-editor.org/rfc/rfc7157)** | IPv6 Multihoming without Network Address Translation | The PA multihoming architecture and the case against NAT. |
@@ -355,7 +437,8 @@ multihoming in any form and accept a single upstream delegation. Assume no.
 
 | Document | Status | Why it matters here |
 | :-- | :-- | :-- |
-| **[draft-ietf-v6ops-rfc7084bis](https://datatracker.ietf.org/doc/draft-ietf-v6ops-rfc7084bis/)** | -06, 6 July 2026. WG document, IESG state "I-D Exists"; the December 2025 milestone to submit to the IESG has slipped. Intended status BCP; obsoletes RFC 7084 **and** RFC 9818. | The single most relevant document. **L-14** (new): ICMPv6 Destination Unreachable code 5 for packets sourced from an invalidated prefix. **L-13** repurposed to "MUST signal stale configuration information as specified in RFC 9096 §3.5". **L-15/L-16**: cap LAN lifetimes to remaining WAN-learned lifetimes. **L-20**: implement SLAAC renumbering per draft-ietf-6man-slaac-renum. **L-21**: RA Guard MUST NOT be on by default. **WPD-3**: accept a delegated prefix smaller than the hint, log an error if it can't address all interfaces. Cite as work in progress. |
+| **[draft-ietf-v6ops-rfc7084bis](https://datatracker.ietf.org/doc/draft-ietf-v6ops-rfc7084bis/)** | -06, 6 July 2026. WG document, IESG state "I-D Exists"; the December 2025 milestone to submit to the IESG has slipped. Intended status BCP; obsoletes RFC 7084 **and** RFC 9818. The direct successor to RFC 7084 and the most consequential document here.
+**L-14** (new): ICMPv6 Destination Unreachable code 5 for packets sourced from an invalidated prefix. **L-13** repurposed to "MUST signal stale configuration information as specified in RFC 9096 §3.5". **L-15/L-16**: cap LAN lifetimes to remaining WAN-learned lifetimes. **L-20**: implement SLAAC renumbering per draft-ietf-6man-slaac-renum. **L-21**: RA Guard MUST NOT be on by default. **WPD-3**: accept a delegated prefix smaller than the hint, log an error if it can't address all interfaces. Cite as work in progress. |
 | **[RFC 9762](https://www.rfc-editor.org/rfc/rfc9762)** | Standards Track, June 2025 | Defines the PIO **P flag** signaling that the network prefers DHCPv6-PD over per-address assignment; updates RFC 4861/4862. 7084bis LPD-11 says CE routers SHOULD use it. Implemented in odhcpd. |
 | **[RFC 9663](https://www.rfc-editor.org/rfc/rfc9663)** | Informational, October 2024 | The per-client DHCPv6-PD deployment model the P flag points at. |
 | **[RFC 9818](https://www.rfc-editor.org/rfc/rfc9818)** | Informational, July 2025; updates RFC 7084 | LAN-side prefix delegation on CE routers (LPD-1…LPD-11), folded into 7084bis. Relevant if you have downstream routers competing for the same delegation. |
@@ -363,14 +446,12 @@ multihoming in any form and accept a single upstream delegation. Assume no.
 | **[draft-ietf-6man-slaac-renum](https://datatracker.ietf.org/doc/draft-ietf-6man-slaac-renum/)** | -14, 5 July 2026; WG document | Successor work to RFC 8978. §5.3 removes RFC 4862's two-hour restriction so hosts can honor small valid lifetimes. Linux kernel and NetworkManager already do. |
 | **[draft-ietf-snac-simple](https://datatracker.ietf.org/doc/draft-ietf-snac-simple/)** | -12, 30 August 2026; submitted to the IESG | Stub-network autoconfiguration; the reason 7084bis L-21 forbids RA Guard by default. |
 
-### Not covered here
+### A note on carrier technologies
 
-Multipath transports (MPTCP, QUIC multipath) move failover to the transport layer
-and genuinely help, but require server-side support you don't control, so they
-are not a substitute for gateway behavior. SRv6 and EVPN multihoming are carrier
-technologies for a different problem (PE/CE L2VPN redundancy) and do not address
-PA site multihoming at a consumer edge; they are frequently and incorrectly cited
-as if they did.
+SRv6 and EVPN multihoming appear in vendor material adjacent to this topic and
+are sometimes cited as if they addressed it. They solve PE/CE L2VPN redundancy in
+provider networks, not PA site multihoming at a customer edge, and nothing in
+them is applicable to CE or SMB equipment.
 
 ### Community & platform threads
 
