@@ -18,29 +18,33 @@ The primary focus is **Provider-Assigned (PA) multihoming without NAT**. We also
 cover translation-based workarounds (NPTv6 and, separately, NAT66 — they are not
 the same thing) and note BGP for context.
 
-### Read this first: most consumer multi-WAN cannot do PA multihoming at all
+### What your uplinks actually give you
 
-The dominant consumer topology is fiber/cable primary plus LTE/5G backup. Mobile
-carriers generally do **not** offer DHCPv6-PD; they assign a single /64 to the
-WAN link, typically via SLAAC, where it is on-link rather than routed to you
-([RFC 7278](https://www.rfc-editor.org/rfc/rfc7278) documents the /64-extension
-workaround). Consequences:
+Before choosing an architecture, establish what each ISP hands the CE router.
+This constrains the design more than any router feature does.
 
-- **No second prefix means nothing to advertise on failover.** PA multihoming is
-  structurally impossible, not merely unsupported by your router.
-- **A single /64 is sufficient only for a literal one-link CE.** RFC 7084 L-2
-  (and L-2 in the 7084bis draft) requires a separate /64 per LAN interface. If
-  you run VLANs or any downstream router, one /64 is not enough — and the bis
-  draft's LPD-2 says to log a management error when prefixes are insufficient,
-  while LPD-4 requires keeping remaining prefixes available for downstream
-  delegation. There are none.
-- Re-advertising an on-link WAN /64 onto the LAN requires RFC 7278-style handoff
-  or ND proxy, which is a per-implementation question, not a spec guarantee.
-  UniFi exposes this as "Single Network" mode.
+- **A delegated prefix shorter than /64** (DHCPv6-PD, commonly a /56 or /48,
+  sometimes a /60). Full design space: a /64 per LAN segment per provider.
+- **A single routed /64.** Sufficient for PA multihoming on exactly one LAN
+  segment — hosts there hold a global address from each provider and everything
+  in this document applies unchanged. It cannot be subdivided, so any additional
+  VLAN or downstream router receives nothing from that provider. RFC 7084 L-2
+  requires a separate /64 per LAN interface, and the 7084bis draft's LPD-2 and
+  LPD-4 expect leftover prefixes to remain available for downstream delegation;
+  a single /64 satisfies neither beyond the first segment.
+- **A /64 that is on-link rather than routed.** Mobile carriers commonly assign
+  the /64 to the WAN link via SLAAC instead of delegating it. Moving it to a LAN
+  link then requires RFC 7278-style handoff or ND proxy — an implementation-
+  specific capability, not a spec guarantee. UniFi exposes this as "Single
+  Network" mode.
+- **No usable IPv6 prefix** (IPv4-only service, or a modem that will not pass one
+  through). That provider cannot participate in PA multihoming at all;
+  translation from a stable internal prefix is the only way that path carries
+  IPv6.
 
-If that describes your backup link, skip to
-[Translation](#2-translation-nptv6-vs-nat66-the-ipv4-style-way) — deprecation-only
-failover or ULA + translation is the entire viable design space.
+Note that prefix size and delivery method are independent constraints. A small
+prefix limits how many segments a provider can serve; an on-link assignment
+affects whether you can use it on the LAN at all.
 
 ---
 
@@ -110,9 +114,9 @@ reversible, so inbound works if the mapping is configured.
 
 **NAT66** is stateful, conntrack-based source NAT/PAT — IPv4 masquerading with an
 address-family selector. It follows the outbound interface's current address,
-which is exactly what you want for failover, but there is no deterministic
-external address for a LAN host, so every inbound service needs an explicit DNAT
-rule. That is port forwarding, on IPv6, in 2026.
+which suits failover — the translation follows the active uplink with no
+reconfiguration — but there is no deterministic external address for a LAN host,
+so every inbound service needs an explicit DNAT rule — per-service port forwarding, on a protocol designed not to need it.
 
 - **Verdict**: NPTv6 is a reasonable stopgap and the only approach where failover
   works without SADR, because the LAN prefix never changes. NAT66 is strictly
@@ -180,8 +184,8 @@ bug or writing a script:
 Destination Unreachable **code 5** ("source address failed ingress/egress policy")
 for packets forwarded to it using an address from an invalidated prefix. This is
 the fix for clients that never see or never act on the RA: they get an immediate
-error instead of a timeout. It is also a more testable ask than "send a
-deprecation RA" — lead a vendor bug report with it.
+error instead of a timeout. It is also more precisely testable than "send a
+deprecation RA": a single packet capture confirms or refutes conformance.
 
 ### Health detection
 
@@ -213,12 +217,10 @@ actually fail.
 - **[RFC 8981](https://www.rfc-editor.org/rfc/rfc8981) temporary addresses** mean
   each host holds several addresses per prefix. Deprecation via PIO covers them
   all (they derive from the same prefix), but per-address hacks do not.
-- **Host-side "fixes" are the wrong lever.** Windows'
-  `DisabledComponents = 0x20` (prefer IPv4) works and is documented, but it sends
-  *all* dual-stack traffic over IPv4 permanently, including on the healthy
-  primary WAN — opting out of IPv6 to avoid a problem that occurs during outages.
-  It is also Windows-only and per-machine; the Linux analogue is a `gai.conf`
-  precedence line, and macOS has no clean equivalent. Fix it at the gateway.
+- **Per-host address-family preferences do not generalize.** Windows'
+  `DisabledComponents` registry value and the Linux `gai.conf` precedence table
+  can force IPv4 preference, but they apply unconditionally rather than during
+  outages, are configured per machine, and have no clean macOS equivalent.
 
 ## Inbound and DNS
 
@@ -231,10 +233,9 @@ document:
   updater, or don't publish AAAA for services you need during outages.
 - With NAT66, there is no deterministic external address at all — per-service
   DNAT rules, per WAN.
-- An outbound-initiated tunnel (WireGuard to a VPS, or a hosted tunnel service)
-  sidesteps all of this and is CGNAT-immune, which matters because cellular
-  backups are almost always CGNAT'd on IPv4. If remote access must survive
-  failover, this is usually the least-bad answer.
+- Dynamic DNS driven by the active uplink's prefix is the general answer, and it
+  inherits the TTL problem above: reachability returns only as fast as resolvers
+  re-query.
 
 ---
 
@@ -245,38 +246,39 @@ relying on them.
 
 ### Ubiquiti UniFi (UDM / UCG / UXG, UniFi OS)
 
-- **Under the hood** (observed on UDM-class UniFi OS; confirm on your model with
-  `ps aux | grep -E 'dnsmasq|odhcp'`): LAN RAs and DHCPv6 come from **dnsmasq**,
+- **Under the hood** (documented for UDM-class hardware; other UniFi OS models
+  share the image but are worth confirming individually): LAN RAs and DHCPv6
+  come from **dnsmasq**,
   configured by the UniFi config generator into `/run/dnsmasq.conf.d/` (DHCP bits
   moved to `/run/dnsmasq.dhcp.conf.d/` on newer Network releases). The WAN PD
   client is **odhcp6c**. No radvd, no odhcpd. The UI's RA toggle and RA priority
   map onto dnsmasq's `enable-ra` / `ra-param`.
-- **dnsmasq is not the blocker.** With `dhcp-range=::,constructor:<br>,…`,
-  dnsmasq derives advertised prefixes from the GUAs actually present on the
-  bridge and tracks their state — departed prefixes are kept in an "old prefix"
-  list and advertised with zeroed lifetimes, and its `deprecated` lease-time mode
-  sets the preferred lifetime to zero. Both levers are reachable from outside:
-  `ip -6 addr change <pfx>::1/64 dev <br> preferred_lft 0` produces exactly the
-  deprecation RA you want, and dnsmasq will advertise two prefixes on one
-  interface. The gap is that UniFi's failover logic operates at the IPv4
-  route/NAT layer and never touches LAN-side IPv6 addressing, so the stale prefix
-  stays live with a router still advertising it.
+- **The RA daemon is not the limiting factor.** With
+  `dhcp-range=::,constructor:<bridge>,…`, dnsmasq derives advertised prefixes
+  from the global addresses actually present on the bridge and follows their
+  state: departed prefixes move to an "old prefix" list and are advertised with
+  zeroed lifetimes, and its `deprecated` lease-time mode sets the preferred
+  lifetime to zero. It will also advertise multiple prefixes on one interface.
+  Because it is driven entirely by kernel address state, deprecation follows
+  automatically from deprecating or removing the bridge address. The gap is
+  above it: UniFi's failover logic operates at the IPv4 route/NAT layer and does
+  not touch LAN-side IPv6 addressing, so a stale prefix stays live with a router
+  still advertising it.
 - **NAT66 is not NPTv6.** UniFi added IPv6 NAT66 rules to the Policy Table in
   Network 9.4.19; per Ubiquiti's own NAT documentation the engine offers SNAT,
   DNAT, and Masquerade, with Masquerade the default — stateful PAT, no stateless
   1:1 prefix mapping. That is worse than pfSense/OPNsense NPTv6 for inbound, and
   fine for outbound-only failover.
-- **ULA is available**: "Additional IPs" on a VLAN's IPv6 settings (added in
-  Network 10.0.160, November 2025) lets clients hold a PD-derived GUA and a ULA
-  simultaneously — the building block for "native v6 on primary, translated on
-  backup."
+- **ULA addressing is available**: the "Additional IPs" option on a VLAN's IPv6
+  settings (added in Network 10.0.160, November 2025) allows a segment to carry
+  both a PD-derived global prefix and a ULA.
 - **No IPv6 failover handling as of Network 10.6.101 (26 August 2026).** IPv6
   work through 2026 has been reporting, WireGuard, DS-Lite, MAP-E, and validation
   fixes; nothing that deprecates prefixes or implements SADR on WAN failover.
-- **If you script it**, note that anything written into the generated dnsmasq
-  config is clobbered on reboot, re-provision, network edit, or firmware update.
-  An on-boot hook (`/mnt/data/on_boot.d/`, via uniFios-utilities) is the usual
-  approach and can still race a re-provision.
+- **The config is generated, not authoritative on disk.** The controller
+  rewrites the dnsmasq configuration on provisioning, network edits, and firmware
+  updates, so local modifications do not survive. Any workaround has to be
+  reapplied by an on-boot hook, and can still race a re-provision.
 
 ### OpenWrt (25.12 stable; 24.10 old stable as of September 2026)
 
@@ -331,7 +333,7 @@ multihoming in any form and accept a single upstream delegation. Assume no.
 | **[RFC 6724](https://www.rfc-editor.org/rfc/rfc6724)** | Default Address Selection for IPv6 | Rule 3 (avoid deprecated) makes preferred-lifetime-0 work. Rule 5.5 is what makes two live prefixes work, and is the weakly supported part. |
 | **[RFC 7084](https://datatracker.ietf.org/doc/html/rfc7084)** | Basic Requirements for IPv6 Customer Edge Routers | G-5 (router lifetime 0 on WAN loss), L-13 (deprecate replaced prefixes), L-2 (a /64 per LAN interface). Being obsoleted — see below. |
 | **[RFC 7157](https://www.rfc-editor.org/rfc/rfc7157)** | IPv6 Multihoming without Network Address Translation | The PA multihoming architecture and the case against NAT. |
-| **[RFC 7278](https://www.rfc-editor.org/rfc/rfc7278)** | Extending an IPv6 /64 Prefix from a 3GPP Mobile Interface to a LAN Link | The only way a cellular /64 reaches your LAN. |
+| **[RFC 7278](https://www.rfc-editor.org/rfc/rfc7278)** | Extending an IPv6 /64 Prefix from a 3GPP Mobile Interface to a LAN Link | How a /64 assigned to a mobile WAN link can be extended to a LAN link. |
 | **[RFC 7368](https://datatracker.ietf.org/doc/rfc7368/)** | IPv6 Home Networking Architecture Principles | Multi-prefix home network principles. |
 | **[RFC 8028](https://www.rfc-editor.org/rfc/rfc8028)** | First-Hop Router Selection in a Multi-Prefix Network | Hosts should pick the router matching their source prefix. |
 | **[RFC 8475](https://datatracker.ietf.org/doc/rfc8475/)** | Using Conditional Router Advertisements for Enterprise Multihoming | The reference design for signaling link health via RAs. |
